@@ -1,0 +1,9 @@
+torch
+transformers
+sentence-transformers
+pymilvus>=2.3.0
+numpy
+requests
+langchain
+jieba>=0.42
+rank-bm25>=0.2.2
