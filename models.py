@@ -216,7 +216,7 @@ def load_reranker():
     global reranker_model
     if reranker_model is None:
         from sentence_transformers import CrossEncoder
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        device = config.RERANKER_DEVICE
         reranker_model = CrossEncoder(
             config.RERANK_MODEL_NAME,
             max_length=512,

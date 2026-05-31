@@ -44,7 +44,8 @@ SPARSE_WEIGHT = 1.0               # 稀疏路径在 RRF 融合中的权重
 RERANK_ENABLED = True             # 是否启用 Cross-Encoder 重排序
 RERANK_MODEL_NAME = "models/bge-reranker-v2-m3"  # reranker 模型名称或本地路径
 RERANK_RETRIEVAL_K = 60           # 初检时从 Milvus 检索的候选数量（应 > TOP_K）
-RERANK_BATCH_SIZE = 16            # reranker 推理批次大小
+RERANK_BATCH_SIZE =3            # reranker 推理批次大小
+RERANKER_DEVICE = "cpu"           # Reranker 推理设备: "cpu" / "cuda:0" (显存不足时选 cpu)
 
 # 分数融合配置（Milvus 余弦相似度 + Reranker Cross-Encoder 分数）
 FUSION_ENABLED = True              # 是否启用分数融合（False 则仅用 Reranker 分数）
