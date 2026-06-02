@@ -7,3 +7,5 @@ requests
 langchain
 jieba>=0.42
 rank-bm25>=0.2.2
+neo4j>=5.0.0
+redis>=4.0.0

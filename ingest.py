@@ -3,6 +3,7 @@ import argparse
 import config
 import models
 import milvus_client
+import cache
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 SUMMARY_BATCH_SIZE = 3000     # 每批输入字符数（配合 RecursiveCharacterTextSplitter 在句子边界切分）
@@ -138,7 +139,7 @@ def load_and_process_knowledge_files():
     return documents
 
 
-def ingest(reset=False):
+def ingest(reset=False, build_graph=False):
     print("正在加载并处理知识文档...")
     documents = load_and_process_knowledge_files()
 
@@ -148,7 +149,6 @@ def ingest(reset=False):
 
     print(f"\n共 {len(documents)} 条记录，正在生成 Embedding（基于 text1 短摘要）...")
 
-    # 基于 text1（短摘要）生成 embedding
     texts_for_emb = [doc["text1"] for doc in documents]
     embeddings = models.encode_texts(texts_for_emb)
 
@@ -166,9 +166,24 @@ def ingest(reset=False):
     count = milvus_client.insert_documents(docs_with_embeddings)
     print(f"入库完成，新增 {count} 条记录")
 
+    if count > 0:
+        cache.invalidate_all()
+
+    if build_graph:
+        print(f"\n{'=' * 50}")
+        print("构建 Neo4j 知识图谱...")
+        try:
+            import entity_relation_extractor
+            entity_relation_extractor.extract_and_build_graph(clear_first=reset)
+        except ImportError:
+            print("[图谱] entity_relation_extractor 模块不可用，跳过图谱构建")
+        except Exception as e:
+            print(f"[图谱] 构建失败: {e}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="知识入库工具 — 双字段摘要存储")
+    parser = argparse.ArgumentParser(description="知识入库工具 — 双字段摘要存储 + 知识图谱构建")
     parser.add_argument("--reset", action="store_true", help="清空旧数据后重新入库")
+    parser.add_argument("--build-graph", action="store_true", help="同时构建 Neo4j 知识图谱")
     args = parser.parse_args()
-    ingest(reset=args.reset)
+    ingest(reset=args.reset, build_graph=args.build_graph)

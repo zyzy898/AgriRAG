@@ -11,9 +11,36 @@ embedding_tokenizer = None
 reranker_model = None
 
 
+def _free_gpu_memory():
+    """释放 PyTorch 缓存的 GPU 显存"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def unload_reranker():
+    """将 Reranker 模型移到 CPU 并释放其 GPU 显存"""
+    global reranker_model
+    if reranker_model is not None:
+        if hasattr(reranker_model, "model"):
+            reranker_model.model.to("cpu")
+        reranker_model = None
+        _free_gpu_memory()
+
+
+def unload_embedding_model():
+    """将 Embedding 模型移到 CPU 并释放其 GPU 显存"""
+    global embedding_model, embedding_tokenizer
+    if embedding_model is not None:
+        embedding_model.cpu()
+        embedding_model = None
+        embedding_tokenizer = None
+        _free_gpu_memory()
+
+
 def load_embedding_model():
     global embedding_model, embedding_tokenizer
     if embedding_model is None:
+        unload_reranker()
         model_path = config.EMBEDDING_MODEL_PATH
         try:
             embedding_tokenizer = AutoTokenizer.from_pretrained(
@@ -156,41 +183,51 @@ def _handle_stream_response(resp):
     return full_content
 
 
-def rrf_fusion(dense_results, sparse_results, k=60, dense_weight=1.0, sparse_weight=1.0):
-    """RRF (Reciprocal Rank Fusion) 多路召回融合
+def rrf_fusion(*args, k=60, dense_weight=None, sparse_weight=None, graph_weight=None, paths=None):
+    """RRF (Reciprocal Rank Fusion) 多路召回融合 (支持2路或3路)
 
     公式: score(doc) = Σ weight_r / (k + rank_i(doc, r))
 
+    支持两种调用方式:
+      1. 旧式: rrf_fusion(dense_results, sparse_results, k=60, dense_weight=1.0, sparse_weight=1.0)
+      2. 新式: rrf_fusion(paths=[{"results": ..., "weight": ..., "name": ...}, ...], k=60)
+
     Args:
-        dense_results: 稠密向量召回结果列表
-        sparse_results: 稀疏关键词召回结果列表
         k: RRF 平滑参数
-        dense_weight: 稠密路径权重
-        sparse_weight: 稀疏路径权重
+        paths: 路径列表，每项为 {"results": list, "weight": float, "name": str}
+        旧式参数 (dense_results, sparse_results, dense_weight, sparse_weight) 仍支持
 
     Returns:
         按 RRF 分数降序的合并结果列表
     """
+    if paths is None:
+        paths = []
+        if len(args) >= 1 and args[0]:
+            paths.append({"results": args[0], "weight": dense_weight or 1.0, "name": "dense"})
+        if len(args) >= 2 and args[1]:
+            paths.append({"results": args[1], "weight": sparse_weight or 1.0, "name": "sparse"})
+
     scores = {}
     doc_map = {}
 
-    for rank, doc in enumerate(dense_results):
-        doc_id = doc.get("id") or f"{doc.get('source', '')}|{doc.get('text1', '')}"
-        scores[doc_id] = scores.get(doc_id, 0) + dense_weight / (k + rank + 1)
-        if doc_id not in doc_map:
-            doc_map[doc_id] = dict(doc)
-            doc_map[doc_id]["_dense_rank"] = rank + 1
-            doc_map[doc_id]["_sparse_rank"] = None
+    rank_prefix = {"dense": "_dense_rank", "sparse": "_sparse_rank", "graph": "_graph_rank"}
 
-    for rank, doc in enumerate(sparse_results):
-        doc_id = doc.get("id") or f"{doc.get('source', '')}|{doc.get('text1', '')}"
-        scores[doc_id] = scores.get(doc_id, 0) + sparse_weight / (k + rank + 1)
-        if doc_id not in doc_map:
-            doc_map[doc_id] = dict(doc)
-            doc_map[doc_id]["_sparse_rank"] = rank + 1
-            doc_map[doc_id]["_dense_rank"] = None
-        else:
-            doc_map[doc_id]["_sparse_rank"] = rank + 1
+    for path in paths:
+        results = path.get("results", [])
+        weight = path.get("weight", 1.0)
+        name = path.get("name", "unknown")
+        rank_key = rank_prefix.get(name, f"_{name}_rank")
+
+        for rank, doc in enumerate(results):
+            doc_id = doc.get("id") or f"{doc.get('source', '')}|{doc.get('text1', '')}"
+            scores[doc_id] = scores.get(doc_id, 0) + weight / (k + rank + 1)
+            if doc_id not in doc_map:
+                doc_map[doc_id] = dict(doc)
+                for pk in rank_prefix.values():
+                    doc_map[doc_id][pk] = None
+                doc_map[doc_id][rank_key] = rank + 1
+            else:
+                doc_map[doc_id][rank_key] = rank + 1
 
     merged = [
         {
@@ -202,11 +239,13 @@ def rrf_fusion(dense_results, sparse_results, k=60, dense_weight=1.0, sparse_wei
     ]
     merged.sort(key=lambda x: x["score"], reverse=True)
 
-    if dense_results or sparse_results:
-        dense_hits = sum(1 for d in merged if d["_dense_rank"] is not None)
-        sparse_hits = sum(1 for d in merged if d["_sparse_rank"] is not None)
-        both_hits = sum(1 for d in merged if d["_dense_rank"] is not None and d["_sparse_rank"] is not None)
-        print(f"  RRF融合: 稠密{dense_hits}条 + 稀疏{sparse_hits}条 → 去重{len(merged)}条 (两路重叠{both_hits}条)")
+    path_names = [p.get("name", "?") for p in paths]
+    path_hits_parts = []
+    for p in paths:
+        rk = rank_prefix.get(p.get("name", ""), f"_{p.get('name', '')}_rank")
+        hits = sum(1 for d in merged if d.get(rk) is not None)
+        path_hits_parts.append(f"{p.get('name', '?')}{hits}条")
+    print(f"  RRF融合: {' + '.join(path_hits_parts)} → 去重{len(merged)}条")
 
     return merged
 
@@ -215,6 +254,7 @@ def load_reranker():
     """加载 Cross-Encoder reranker 模型"""
     global reranker_model
     if reranker_model is None:
+        unload_embedding_model()
         from sentence_transformers import CrossEncoder
         device = config.RERANKER_DEVICE
         reranker_model = CrossEncoder(
