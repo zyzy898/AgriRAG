@@ -52,6 +52,13 @@ GRAPH_RECALL_K = 15               # 图检索召回数量
 
 # Reranker 配置
 RERANK_ENABLED = True             # 是否启用 Cross-Encoder 重排序
+
+# 精排前内容去重（只做结构去重+text1短摘要去重，不做text2长文去重）
+DEDUP_BEFORE_RERANK_ENABLED = True  # 是否启用
+DEDUP_MAX_PER_SOURCE = 3            # 同源文档最多保留条数
+DEDUP_SKIP_GRAPH = True             # 图谱候选（id以graph:开头）不参与内容去重
+DEDUP_TEXT1_JACCARD_THRESHOLD = 0.85  # 跨源 text1 短摘要 Jaccard 阈值（保守）
+DEDUP_SAME_SOURCE_THRESHOLD = 0.35   # 同源 text1 短摘要 Jaccard 阈值（0.35能区分"症状"vs"防治"但能捕获相邻重叠）
 RERANK_MODEL_NAME = "models/bge-reranker-v2-m3"  # reranker 模型名称或本地路径
 RERANK_RETRIEVAL_K = 60           # 初检时从 Milvus 检索的候选数量（应 > TOP_K）
 RERANK_BATCH_SIZE = 10            # reranker 推理批次大小
@@ -69,6 +76,8 @@ REDIS_DB = int(os.environ.get("REDIS_DB", 0))
 REDIS_PASSWORD = os.environ.get("None") 
 REDIS_TTL = int(os.environ.get("REDIS_TTL", 86400))   # 答案缓存过期时间（秒），默认 24 小时
 REDIS_CACHE_ENABLED = os.environ.get("REDIS_CACHE_ENABLED", "1") != "0"
+REDIS_CACHE_THRESHOLD = 5        # 同一问题被问多少次后进入缓存
+CACHE_CSV_DIR = os.path.join(BASE_DIR, "cache")  # 缓存 CSV 输出目录
 
 # System Prompt（角色设定和要求，用于 chat template 的 system 消息）
 SYSTEM_PROMPT = """你是一位专业的农业技术顾问，擅长樱桃种植、番茄栽培、温室管理等领域。请严格根据下方提供的参考知识来回答用户问题。

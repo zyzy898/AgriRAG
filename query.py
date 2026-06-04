@@ -68,6 +68,16 @@ def retrieve_context(question, top_k=None, show_score=True):
     if not filtered and dense_results:
         print(f"  (所有结果相似度低于阈值 {config.SIMILARITY_THRESHOLD}，已过滤)")
 
+    # === 精排前内容去重 ===
+    if config.DEDUP_BEFORE_RERANK_ENABLED and config.RERANK_ENABLED and len(filtered) > 1:
+        filtered = models.deduplicate_candidates(
+            filtered,
+            max_per_source=config.DEDUP_MAX_PER_SOURCE,
+            skip_graph=config.DEDUP_SKIP_GRAPH,
+            text1_jaccard_threshold=config.DEDUP_TEXT1_JACCARD_THRESHOLD,
+            same_source_threshold=config.DEDUP_SAME_SOURCE_THRESHOLD,
+        )
+
     # === Reranker 重排序 ===
     if config.RERANK_ENABLED and filtered:
         try:
@@ -141,6 +151,7 @@ def answer_question(question):
     if cached is not None:
         answer = cached["answer"]
         source_legend = cached.get("source_legend", "")
+        cache.increment_counter(question)
         if config.LLM_API_STREAM:
             print(f"\n  [缓存命中] {answer}")
         else:
@@ -175,7 +186,14 @@ def answer_question(question):
     print(f"\n检索: {t_retrieve:.2f}s | 生成: {t_generate:.2f}s | 总计: {t_retrieve + t_generate:.2f}s")
 
     if answer and not answer.startswith("[错误]"):
-        cache.set_cached_answer(question, answer, source_legend)
+        count = cache.increment_counter(question)
+        threshold = config.REDIS_CACHE_THRESHOLD
+        if count == threshold:
+            cache.set_cached_answer(question, answer, source_legend)
+            print(f"  [缓存] 该问题已达到 {threshold} 次，已缓存")
+        elif count > threshold:
+            cache.set_cached_answer(question, answer, source_legend)
+            print(f"  [缓存] 第 {count} 次，更新缓存答案")
 
     return answer, source_legend
 

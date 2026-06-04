@@ -250,6 +250,112 @@ def rrf_fusion(*args, k=60, dense_weight=None, sparse_weight=None, graph_weight=
     return merged
 
 
+def deduplicate_candidates(candidates, max_per_source=3, skip_graph=True,
+                           text1_jaccard_threshold=0.85, same_source_threshold=0.50,
+                           window_size=5):
+    """精排前内容去重：结构去重 + text1 短摘要分层 Jaccard
+
+    策略：
+      - 不对 text2（800字长文）做 Jaccard
+      - 只对 text1（LLM生成的～20字短摘要）做 Jaccard
+      - 分层阈值：同源用 0.50（激进），跨源用 0.85（保守）
+
+    直觉：
+      - 同源文档内，相邻切片（LangChain 120字重叠）text1 天然相似，
+        0.50 的阈值足够捕获真正的重叠冗余，但能区分"症状"和"防治"
+      - 跨源文档，相同的知识点可能被多本书描述，但措辞角度不同，
+        0.85 的高阈值确保只在几乎完全相同时才去重
+
+    流程：
+      Stage 0: 图谱候选硬保留
+      Stage 1: 同源多样性限制（每 source ≤ N 条）
+      Stage 2: text1 分层 Jaccard 滑动窗口去重
+    """
+    if not candidates:
+        return candidates
+
+    import jieba
+
+    def _is_graph(c):
+        return skip_graph and c.get("id", "").startswith("graph:")
+
+    def _tokenize(text):
+        return set(jieba.cut(text)) if text else set()
+
+    # === Stage 0: 分离图谱 ===
+    graph_pool = [c for c in candidates if _is_graph(c)]
+    text_pool = [c for c in candidates if not _is_graph(c)]
+
+    if not text_pool:
+        return graph_pool
+
+    # === Stage 1: 同源多样性限制 ===
+    stage1 = []
+    source_counts = {}
+    for c in text_pool:
+        src = c.get("source", "")
+        count = source_counts.get(src, 0)
+        if count < max_per_source:
+            stage1.append(c)
+            source_counts[src] = count + 1
+
+    if len(stage1) <= 1:
+        result = stage1 + graph_pool
+        result.sort(key=lambda x: x.get("rrf_score", x.get("score", 0)), reverse=True)
+        if len(candidates) > len(result):
+            print(f"  内容去重: {len(candidates)}条 → {len(result)}条 (同源≤{max_per_source}, 图谱{len(graph_pool)}条保留)")
+        return result
+
+    # === Stage 2: text1 分层 Jaccard 滑动窗口去重 ===
+    text1_list = [c.get("text1", "") for c in stage1]
+    tokenized = [_tokenize(t) for t in text1_list]
+    sources = [c.get("source", "") for c in stage1]
+
+    kept = [stage1[0]]
+    kept_tokens = [tokenized[0]]
+    kept_sources = [sources[0]]
+
+    for i in range(1, len(stage1)):
+        ti = tokenized[i]
+        if not ti:
+            kept.append(stage1[i])
+            kept_tokens.append(set())
+            kept_sources.append(sources[i])
+            continue
+
+        discarded = False
+        start_j = max(0, len(kept) - window_size)
+        for j in range(start_j, len(kept)):
+            tj = kept_tokens[j]
+            if not tj:
+                continue
+
+            same_source = (sources[i] == kept_sources[j])
+            threshold = same_source_threshold if same_source else text1_jaccard_threshold
+
+            intersection = len(ti & tj)
+            union = len(ti | tj)
+            sim = intersection / union if union > 0 else 0
+            if sim > threshold:
+                discarded = True
+                break
+
+        if not discarded:
+            kept.append(stage1[i])
+            kept_tokens.append(ti)
+            kept_sources.append(sources[i])
+
+    # === 合并图谱 ===
+    result = kept + graph_pool
+    result.sort(key=lambda x: x.get("rrf_score", x.get("score", 0)), reverse=True)
+
+    if len(candidates) > len(result):
+        print(f"  内容去重: {len(candidates)}条 → {len(result)}条 "
+              f"(同源≤{max_per_source}, text1-Jaccard同源{same_source_threshold}/跨源{text1_jaccard_threshold}, "
+              f"图谱{len(graph_pool)}条保留)")
+    return result
+
+
 def load_reranker():
     """加载 Cross-Encoder reranker 模型"""
     global reranker_model

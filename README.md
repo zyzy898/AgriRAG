@@ -1,6 +1,6 @@
 # AgriRAG — 农业领域知识问答系统
 
-基于 **RAG（Retrieval-Augmented Generation）** 的垂直领域智能问答系统。LLM 分批摘要 + 双字段向量存储 + **三路召回融合** (稠密向量 + BM25稀疏 + Neo4j图检索) + 分数融合重排序 + **Redis 答案缓存**。
+基于 **RAG（Retrieval-Augmented Generation）** 的垂直领域智能问答系统。LLM 分批摘要 + 双字段向量存储 + **三路召回融合** (稠密向量 + BM25稀疏 + Neo4j图检索) + text1 分层去重 + 分数融合重排序 + **Redis 答案缓存**。
 
 ## 性能优化（v2）
 
@@ -12,7 +12,9 @@
 | GPU 共享 | Embedding 用完自动卸载，释放 GPU 给 Reranker | Reranker CPU(60s) → GPU(3-5s) |
 | BM25 启动预加载 | 系统启动时建好 BM25 索引 | 消除首次查询冷启动 |
 | Reranker 切 GPU | `RERANKER_DEVICE = "cuda:0"` | 560M 模型 GPU 推理替代 CPU |
-| Redis 答案缓存 | 问题 MD5 → Redis，命中直接返回 | 重复查询 <0.01s，节省 API 调用 |
+| text1 分层去重 | jieba + text1短摘要 Jaccard 分层阈值 | 精排候选缩减 25-40%，总延迟降低 15-30% |
+| Redis 答案缓存 | 同一问题被问5次后进入缓存，命中直返 | 重复查询 <0.01s，节省 API 调用 |
+| 缓存 CSV 导出 | 高频问答自动同步到 `cache/faq_answers.csv` | 离线分析常用问题 |
 
 ## 技术架构
 
@@ -28,6 +30,8 @@
                      └────────────────────────────┘
                                                   │
                                          相似度阈值过滤(≥0.30)
+                                                  │
+                                  text1 分层去重: 同源≤3 + text1 Jaccard分层阈值
                                                   │
                                          Cross-Encoder 重排序 (GPU)
                                                   │
@@ -45,6 +49,7 @@
 - **LLM 分批摘要** — 长文档使用 LangChain RecursiveCharacterTextSplitter 按 3000 字/批在句子边界分割（重叠 200 字），每批生成 20 字短摘要 + markdown 长摘要
 - **双字段向量存储** — text1（短摘要）生成 embedding 用于检索，text2（长摘要）命中后直接返回给 LLM
 - **三路召回 + RRF 融合** — 稠密向量 (Milvus COSINE, 60条) + BM25 稀疏关键词 (30条) + Neo4j 图检索 (15条) 三路并行，Reciprocal Rank Fusion 融合去重
+- **text1 分层去重** — RRF 融合后、Cross-Encoder 精排前，仅对 text1（LLM 生成的 20 字短摘要）做 Jaccard 去重，分层阈值（同源 0.35 / 跨源 0.85）。图谱候选硬保留。不对 text2（800 字长文）做去重，避免将同一病害的不同角度（症状/用药/时机）误判为重复
 - **Neo4j 知识图谱** — 从农业知识文本中自动抽取病害实体和关系（症状、传播途径、防治药剂、关联病害），LLM 辅助三元组抽取，存入 Neo4j 图数据库
 - **实体匹配检索** — 支持病害名、药剂名、症状描述三类实体匹配；药剂可反查所治病害，症状可反查对应病害
 - **批量 Cypher 优化** — 子图序列化使用 `UNWIND` 一次性拉取，反向查询使用 `UNION` 合并，消除 N+1 问题
@@ -56,7 +61,7 @@
 - **内容哈希去重** — MD5 确定性 ID，支持增量入库不重复
 - **SSE 流式输出** — API 模式逐 token 输出
 - **短文档直通** — < 3000 字文档跳过 LLM 摘要，原文直接入库
-- **Redis 答案缓存** — 问题 MD5 哈希 → Redis，缓存命中直接返回（< 0.01s）；重新入库自动清除失效缓存；Redis 不可用时静默降级，不影响主流程
+- **Redis 答案缓存** — 问题 MD5 哈希 → Redis 计数，同一问题被问 5 次后自动缓存答案。缓存命中直接返回（<0.01s）。所有高频问答同步导出到 `cache/faq_answers.csv`，Redis 不可用时静默降级
 
 ## 项目结构
 
@@ -176,6 +181,11 @@ python query.py 戊唑醇能治哪些病害？
 | RRF 平滑参数 | `RRF_K` | 60 | 融合平滑参数，越大排名靠后影响越小 |
 | 稠密权重 | `DENSE_WEIGHT` | 1.0 | 稠密路径在 RRF 中的权重 |
 | 稀疏权重 | `SPARSE_WEIGHT` | 1.0 | 稀疏路径在 RRF 中的权重 |
+| 去重开关 | `DEDUP_BEFORE_RERANK_ENABLED` | True | 启用精排前 text1 分层去重 |
+| 去重同源限制 | `DEDUP_MAX_PER_SOURCE` | 3 | 同源文档最多保留条数 |
+| 去重图谱保留 | `DEDUP_SKIP_GRAPH` | True | 图谱候选不参与内容去重 |
+| 去重跨源阈值 | `DEDUP_TEXT1_JACCARD_THRESHOLD` | 0.85 | 跨源 text1 Jaccard 阈值（保守） |
+| 去重同源阈值 | `DEDUP_SAME_SOURCE_THRESHOLD` | 0.35 | 同源 text1 Jaccard 阈值（区分症状/防治/药剂） |
 | Reranker 开关 | `RERANK_ENABLED` | True | 是否启用 Cross-Encoder 重排序 |
 | Reranker 设备 | `RERANKER_DEVICE` | cuda:0 | Reranker 推理设备 (cpu / cuda:0) |
 | Reranker 候选 | `RERANK_RETRIEVAL_K` | 60 | 输入 reranker 的候选数量 |
@@ -188,6 +198,8 @@ python query.py 戊唑醇能治哪些病害？
 | Redis DB | `REDIS_DB` | 0 | 缓存 Redis 数据库编号 |
 | Redis 密码 | `REDIS_PASSWORD` | — | 缓存 Redis 密码（环境变量） |
 | 缓存 TTL | `REDIS_TTL` | 86400 | 答案缓存过期时间（秒），默认 24 小时 |
+| 缓存阈值 | `REDIS_CACHE_THRESHOLD` | 5 | 同一问题被问多少次后才进入缓存 |
+| 缓存 CSV 目录 | `CACHE_CSV_DIR` | `./cache` | 缓存 Q&A CSV 文件输出目录 |
 | 缓存开关 | `REDIS_CACHE_ENABLED` | 1 | 设为 0 关闭缓存 |
 
 ## 入库流程
@@ -228,6 +240,8 @@ python query.py 戊唑醇能治哪些病害？
                        │
                 相似度过滤(≥0.30)
                        │
+                text1 分层去重 (同源≤3, text1 Jaccard 0.35/0.85, 图谱保留)
+                       │
                 Reranker(GPU) 精排
                        │
                 分数融合: α·余弦 + (1-α)·sigmoid(logits)
@@ -235,6 +249,8 @@ python query.py 戊唑醇能治哪些病害？
                 Cross-Encoder 精排 → TOP 30
                        │
                 组装上下文(text2) → LLM API 生成答案
+                       │
+                Redis 计数器 +1 → 达到5次后缓存 → 同步 cache/faq_answers.csv
 ```
 
 ### 召回路径决策
@@ -327,8 +343,9 @@ RETURN d1.名称, d2.名称, p.名称
 
 1. **三路召回** — 稠密向量 (Milvus COSINE) + 稀疏关键词 (BM25) + Neo4j 图检索三路并行检索
 2. **RRF 融合** — Reciprocal Rank Fusion: `score(doc) = Σ weight_r / (k + rank_i(doc, r))`，按排名位置融合三路结果
-3. **Reranker 精评** — bge-reranker-v2-m3 Cross-Encoder (GPU) 对每对 (问题, 文档) 打分，sigmoid 归一化到 [0,1]
-4. **分数融合** — `综合分数 = α × Milvus余弦 + (1-α) × sigmoid(Reranker)`
+3. **text1 分层去重** — 仅对 text1（LLM 生成的 20 字短摘要）做 Jaccard 去重：同源阈值 0.35（区分症状/防治/药剂），跨源阈值 0.85（保守）。图谱候选硬保留，不对 text2 长文做去重
+4. **Reranker 精评** — bge-reranker-v2-m3 Cross-Encoder (GPU) 对每对 (问题, 文档) 打分，sigmoid 归一化到 [0,1]
+5. **分数融合** — `综合分数 = α × Milvus余弦 + (1-α) × sigmoid(Reranker)`
 
 每条上下文标注多维分数：`(综合: 0.7234, Milvus: 0.6500, Reranker: 0.7723, 稠密#5/稀疏#3/图谱#1)`
 
@@ -340,7 +357,7 @@ RETURN d1.名称, d2.名称, p.名称
 
 ```
 查询开始 → Embedding 加载到 GPU → encode → 自动卸载
-         → BM25 / 图谱 / RRF (CPU)
+         → BM25 / 图谱 / RRF / text1 去重 (CPU)
          → Reranker 加载到 GPU → 精排 → 返回结果
 ```
 
